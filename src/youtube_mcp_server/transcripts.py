@@ -33,6 +33,21 @@ class TranscriptUnavailable(Exception):
     """Raised when a video has no usable caption track."""
 
 
+def _opts_variants() -> list[dict]:
+    """Options to try, in order.
+
+    Cookies answer YouTube's bot check on a datacenter IP, but some yt-dlp and
+    YouTube combinations fail only on the cookie path ("The page needs to be
+    reloaded", yt-dlp#17389). Neither path is reliable alone, so try the jar
+    first and fall back to a bare request.
+    """
+    variants = [_FETCH_OPTS]
+    bare = {k: v for k, v in _FETCH_OPTS.items() if k != "cookiefile"}
+    if bare != _FETCH_OPTS:
+        variants.append(bare)
+    return variants
+
+
 def get_transcript(
     video_url: str,
     language: str = "en",
@@ -41,24 +56,36 @@ def get_transcript(
     video_id = _extract_video_id(video_url)
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    with yt_dlp.YoutubeDL(_FETCH_OPTS) as ydl:
-        info = ydl.extract_info(url, download=False)
-        track = _pick_track(info, language)
-        if not track:
-            raise TranscriptUnavailable(
-                f"No transcript available for {video_id}. Subtitles may be disabled."
-            )
-        fmt = _pick_format(track)
-        raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
+    last_error: Exception | None = None
+    for opts in _opts_variants():
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                track = _pick_track(info, language)
+                if not track:
+                    raise TranscriptUnavailable(
+                        f"No transcript available for {video_id}. "
+                        "Subtitles may be disabled."
+                    )
+                fmt = _pick_format(track)
+                raw = ydl.urlopen(fmt["url"]).read().decode(
+                    "utf-8", errors="replace"
+                )
+        except TranscriptUnavailable:
+            # A real absence of captions. Another attempt cannot help.
+            raise
+        except Exception as exc:
+            last_error = exc
+            continue
 
-    if fmt.get("ext") == "json3":
-        segments = _parse_json3(raw)
-    else:
-        segments = _parse_vtt(raw)
+        segments = (
+            _parse_json3(raw) if fmt.get("ext") == "json3" else _parse_vtt(raw)
+        )
+        if not segments:
+            raise TranscriptUnavailable(f"Caption track for {video_id} was empty.")
+        return segments
 
-    if not segments:
-        raise TranscriptUnavailable(f"Caption track for {video_id} was empty.")
-    return segments
+    raise last_error if last_error else TranscriptUnavailable(video_id)
 
 
 def search_transcript(
