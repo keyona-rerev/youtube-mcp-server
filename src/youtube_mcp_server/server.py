@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hmac
 import json
 import sys
 
 from fastmcp import FastMCP
 
-from youtube_mcp_server import youtube, transcripts
+from youtube_mcp_server import config, youtube, transcripts
 
 mcp = FastMCP("YouTube MCP Server")
 
@@ -170,6 +171,52 @@ def search_channel_transcripts(
         return _error(f"Failed to search channel transcripts: {e}")
 
 
+class _TokenGate:
+    """ASGI middleware that requires a shared secret on every HTTP request.
+
+    The server is reachable at a public URL with no OAuth, so without this any
+    caller who learns the URL can use it — including the cookie jar it holds.
+    Set MCP_AUTH_TOKEN to turn it on. Unset, the server stays open and says so
+    at startup.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.token = token
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        presented = ""
+        for name, value in scope.get("headers", []):
+            if name == b"authorization":
+                presented = value.decode("latin-1").removeprefix("Bearer ").strip()
+                break
+            if name == b"x-auth-token":
+                presented = value.decode("latin-1").strip()
+                break
+
+        # compare_digest keeps the check constant-time.
+        if not hmac.compare_digest(presented, self.token):
+            body = b'{"error":"unauthorized"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 401,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+
+        await self.app(scope, receive, send)
+
+
 def main():
     """Run the MCP server."""
     transport = "stdio"
@@ -180,14 +227,33 @@ def main():
 
     if transport == "stdio":
         mcp.run(transport="stdio")
+        return
+
+    import uvicorn
+
+    host = "0.0.0.0"
+    port = 8000
+    if "--port" in sys.argv:
+        idx = sys.argv.index("--port")
+        if idx + 1 < len(sys.argv):
+            port = int(sys.argv[idx + 1])
+
+    print(config.cookie_status(), file=sys.stderr, flush=True)
+
+    app = mcp.http_app(path="/mcp")
+    token = config.auth_token()
+    if token:
+        print("auth: token required", file=sys.stderr, flush=True)
+        app = _TokenGate(app, token)
     else:
-        host = "0.0.0.0"
-        port = 8000
-        if "--port" in sys.argv:
-            idx = sys.argv.index("--port")
-            if idx + 1 < len(sys.argv):
-                port = int(sys.argv[idx + 1])
-        mcp.run(transport="streamable-http", host=host, port=port)
+        print(
+            f"auth: OPEN — anyone with the URL can call this server. "
+            f"Set {config.TOKEN_ENV} to require a token.",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    uvicorn.run(app, host=host, port=port)
 
 
 if __name__ == "__main__":
