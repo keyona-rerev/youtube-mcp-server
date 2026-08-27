@@ -1,15 +1,33 @@
-"""Transcript extraction and search using youtube-transcript-api."""
+"""Transcript extraction and search using yt-dlp caption tracks.
+
+Replaces youtube-transcript-api, which YouTube blocks from datacenter IPs.
+yt-dlp reads the caption tracks from the player response instead, and with
+curl_cffi installed it impersonates a real browser TLS fingerprint.
+"""
 
 from __future__ import annotations
 
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from youtube_transcript_api import YouTubeTranscriptApi
+import yt_dlp
 
 from youtube_mcp_server.models import TranscriptMatch, TranscriptSegment
 
-_api = YouTubeTranscriptApi()
+# Preference order. json3 carries start and duration natively.
+_CAPTION_FORMATS = ("json3", "srv3", "srv1", "vtt")
+
+_FETCH_OPTS = {
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    "socket_timeout": 60,
+}
+
+
+class TranscriptUnavailable(Exception):
+    """Raised when a video has no usable caption track."""
 
 
 def get_transcript(
@@ -18,23 +36,26 @@ def get_transcript(
 ) -> list[TranscriptSegment]:
     """Get the transcript of a YouTube video."""
     video_id = _extract_video_id(video_url)
-    try:
-        transcript = _api.fetch(video_id, languages=[language, "en"])
-    except Exception:
-        # Fallback: try to get any available transcript
-        transcript_list = _api.list(video_id)
-        transcript = transcript_list.find_generated_transcript(
-            [language, "en"]
-        ).fetch()
+    url = f"https://www.youtube.com/watch?v={video_id}"
 
-    return [
-        TranscriptSegment(
-            text=entry.text,
-            start=entry.start,
-            duration=entry.duration,
-        )
-        for entry in transcript
-    ]
+    with yt_dlp.YoutubeDL(_FETCH_OPTS) as ydl:
+        info = ydl.extract_info(url, download=False)
+        track = _pick_track(info, language)
+        if not track:
+            raise TranscriptUnavailable(
+                f"No transcript available for {video_id}. Subtitles may be disabled."
+            )
+        fmt = _pick_format(track)
+        raw = ydl.urlopen(fmt["url"]).read().decode("utf-8", errors="replace")
+
+    if fmt.get("ext") == "json3":
+        segments = _parse_json3(raw)
+    else:
+        segments = _parse_vtt(raw)
+
+    if not segments:
+        raise TranscriptUnavailable(f"Caption track for {video_id} was empty.")
+    return segments
 
 
 def search_transcript(
@@ -82,6 +103,7 @@ def search_channel_transcripts(
     """Search for a query across multiple video transcripts.
 
     video_urls should be a list of dicts with 'url' and 'title' keys.
+    Concurrency is held at 3 to reduce the chance of a YouTube bot check.
     """
     all_matches = []
 
@@ -99,7 +121,7 @@ def search_channel_transcripts(
         except Exception:
             return []
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {pool.submit(_search_one, v): v for v in video_urls[:max_videos]}
         for future in as_completed(futures):
             all_matches.extend(future.result())
@@ -109,14 +131,95 @@ def search_channel_transcripts(
     return all_matches[:15]
 
 
+def _pick_track(info: dict, language: str) -> list[dict] | None:
+    """Choose a caption track. Manual captions win over auto-generated."""
+    manual = info.get("subtitles") or {}
+    auto = info.get("automatic_captions") or {}
+    wanted = [language, language.split("-")[0], "en"]
+
+    for source in (manual, auto):
+        for code in wanted:
+            if code in source:
+                return source[code]
+        # Fall back on a regional variant, e.g. "en-US" for "en".
+        for code in wanted:
+            for key in source:
+                if key.split("-")[0] == code:
+                    return source[key]
+    return None
+
+
+def _pick_format(track: list[dict]) -> dict:
+    for ext in _CAPTION_FORMATS:
+        for fmt in track:
+            if fmt.get("ext") == ext and fmt.get("url"):
+                return fmt
+    raise TranscriptUnavailable("No downloadable caption format found.")
+
+
+def _parse_json3(raw: str) -> list[TranscriptSegment]:
+    data = json.loads(raw)
+    segments = []
+    for event in data.get("events", []):
+        parts = [s.get("utf8", "") for s in event.get("segs", [])]
+        text = "".join(parts).strip()
+        if not text:
+            continue
+        segments.append(
+            TranscriptSegment(
+                text=text,
+                start=event.get("tStartMs", 0) / 1000.0,
+                duration=event.get("dDurationMs", 0) / 1000.0,
+            )
+        )
+    return segments
+
+
+def _ts_to_seconds(stamp: str) -> float:
+    hours, minutes, seconds = stamp.split(":")
+    return int(hours) * 3600 + int(minutes) * 60 + float(seconds.replace(",", "."))
+
+
+def _parse_vtt(raw: str) -> list[TranscriptSegment]:
+    segments = []
+    cue = re.compile(r"(\d+:\d{2}:\d{2}[.,]\d{3})\s+-->\s+(\d+:\d{2}:\d{2}[.,]\d{3})")
+
+    for block in re.split(r"\n\s*\n", raw):
+        lines = [ln for ln in block.splitlines() if ln.strip()]
+        match = None
+        text_lines = []
+        for line in lines:
+            found = cue.search(line)
+            if found and match is None:
+                match = found
+                continue
+            if match is not None:
+                text_lines.append(re.sub(r"<[^>]+>", "", line))
+        if match is None:
+            continue
+        text = " ".join(text_lines).strip()
+        if not text:
+            continue
+        start = _ts_to_seconds(match.group(1))
+        end = _ts_to_seconds(match.group(2))
+        segments.append(
+            TranscriptSegment(text=text, start=start, duration=max(end - start, 0.0))
+        )
+    return segments
+
+
 def _extract_video_id(url: str) -> str:
-    """Extract video ID from a YouTube URL."""
+    """Extract a video ID from a YouTube URL.
+
+    Rejects anything that is not a YouTube video reference. This keeps the
+    tool from being used to fetch arbitrary hosts.
+    """
     patterns = [
-        r"(?:v=|/v/|youtu\.be/)([a-zA-Z0-9_-]{11})",
+        r"(?:v=|/v/|/live/|/embed/|/shorts/|youtu\.be/)([a-zA-Z0-9_-]{11})",
         r"^([a-zA-Z0-9_-]{11})$",
     ]
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             return match.group(1)
-    raise ValueError(f"Could not extract video ID from: {url}")
+    raise ValueError(f"Not a recognized YouTube video URL: {url}")
