@@ -1,0 +1,2 @@
+fastmcp>=2.0.0
+yt-dlp[default,curl-cffi]>=2025.1.1
