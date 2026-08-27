@@ -13,17 +13,20 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yt_dlp
 
+from youtube_mcp_server import config
 from youtube_mcp_server.models import TranscriptMatch, TranscriptSegment
 
 # Preference order. json3 carries start and duration natively.
 _CAPTION_FORMATS = ("json3", "srv3", "srv1", "vtt")
 
-_FETCH_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "skip_download": True,
-    "socket_timeout": 60,
-}
+_FETCH_OPTS = config.with_cookies(
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "socket_timeout": 60,
+    }
+)
 
 
 class TranscriptUnavailable(Exception):
