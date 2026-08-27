@@ -1,2 +1,8 @@
+# Nightly yt-dlp. YouTube changes break the stable release regularly, and the
+# cookie-path bug ("The page needs to be reloaded", yt-dlp#17389) is fixed
+# ahead of stable. Cookies are how this server answers YouTube's bot check,
+# so that path has to work.
+--pre
+
 fastmcp>=2.0.0
-yt-dlp[default,curl-cffi]>=2025.1.1
+yt-dlp[default,curl-cffi]>=2026.8.27
