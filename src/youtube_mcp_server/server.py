@@ -240,6 +240,10 @@ def main():
 
     print(config.cookie_status(), file=sys.stderr, flush=True)
 
+    import yt_dlp
+
+    print(f"yt-dlp: {yt_dlp.version.__version__}", file=sys.stderr, flush=True)
+
     app = mcp.http_app(path="/mcp")
     token = config.auth_token()
     if token:
