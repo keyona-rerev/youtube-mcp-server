@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from urllib.parse import urlparse
+
 import yt_dlp
 
 from youtube_mcp_server.models import Channel, Chapter, Comment, Video
@@ -34,6 +36,7 @@ def search_videos(query: str, limit: int = 10) -> list[Video]:
 
 def get_video_info(video_url: str) -> Video:
     """Get detailed info about a single video."""
+    video_url = _require_youtube_url(video_url)
     opts = {**_BASE_OPTS, "skip_download": True}
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(video_url, download=False)
@@ -97,6 +100,7 @@ def get_channel_videos(
 
 def get_comments(video_url: str, limit: int = 20) -> list[Comment]:
     """Get comments from a video."""
+    video_url = _require_youtube_url(video_url)
     opts = {
         **_BASE_OPTS,
         "skip_download": True,
@@ -122,6 +126,7 @@ def get_comments(video_url: str, limit: int = 20) -> list[Comment]:
 
 def get_playlist_videos(playlist_url: str, limit: int = 50) -> list[Video]:
     """Get videos from a playlist."""
+    playlist_url = _require_youtube_url(playlist_url)
     opts = {
         **_BASE_OPTS,
         "extract_flat": True,
@@ -138,10 +143,35 @@ def get_playlist_videos(playlist_url: str, limit: int = 50) -> list[Video]:
     return videos
 
 
+_YOUTUBE_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
+    "www.youtu.be",
+}
+
+
+def _require_youtube_url(url: str) -> str:
+    """Reject any URL that is not on a YouTube host.
+
+    Without this, a URL argument reaches yt-dlp's generic extractor and the
+    server becomes an open fetcher for arbitrary hosts, including internal
+    addresses reachable from the machine it runs on.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"Only http and https URLs are accepted: {url}")
+    if (parsed.hostname or "").lower() not in _YOUTUBE_HOSTS:
+        raise ValueError(f"Only YouTube URLs are accepted: {url}")
+    return url
+
+
 def _normalize_channel_url(url_or_name: str) -> str:
     """Normalize a channel URL or name to a full URL."""
     if url_or_name.startswith("http"):
-        return url_or_name.rstrip("/")
+        return _require_youtube_url(url_or_name).rstrip("/")
     if url_or_name.startswith("@"):
         return f"https://www.youtube.com/{url_or_name}"
     return f"https://www.youtube.com/@{url_or_name}"
