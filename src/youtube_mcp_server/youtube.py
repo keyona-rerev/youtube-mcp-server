@@ -6,14 +6,17 @@ from urllib.parse import urlparse
 
 import yt_dlp
 
+from youtube_mcp_server import config
 from youtube_mcp_server.models import Channel, Chapter, Comment, Video
 
 
-_BASE_OPTS = {
-    "quiet": True,
-    "no_warnings": True,
-    "extract_flat": False,
-}
+_BASE_OPTS = config.with_cookies(
+    {
+        "quiet": True,
+        "no_warnings": True,
+        "extract_flat": False,
+    }
+)
 
 
 def search_videos(query: str, limit: int = 10) -> list[Video]:
